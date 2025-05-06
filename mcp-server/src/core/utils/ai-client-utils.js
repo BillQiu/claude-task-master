@@ -5,6 +5,7 @@
 
 import { Anthropic } from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
+import axios from 'axios';
 
 // Load environment variables for CLI mode
 dotenv.config();
@@ -44,6 +45,49 @@ export function getAnthropicClientForMCP(session, log = console) {
 		});
 	} catch (error) {
 		log.error(`Failed to initialize Anthropic client: ${error.message}`);
+		throw error;
+	}
+}
+
+/**
+ * Get an OpenAI compatible client instance initialized with MCP session environment variables
+ * @param {Object} [session] - Session object from MCP containing environment variables
+ * @param {Object} [log] - Logger object to use (defaults to console)
+ * @returns {Object} Axios client configured for OpenAI compatible API
+ * @throws {Error} If required configuration is missing
+ */
+export function getOpenAICompatibleClientForMCP(session, log = console) {
+	try {
+		// Extract API base URL and key from session.env or fall back to environment variables
+		const baseURL =
+			session?.env?.OPENAI_API_BASE_URL || process.env.OPENAI_API_BASE_URL;
+
+		if (!baseURL) {
+			throw new Error(
+				'OPENAI_API_BASE_URL not found in session environment or process.env'
+			);
+		}
+
+		// API key may be optional for some local API servers
+		const apiKey =
+			session?.env?.OPENAI_API_KEY ||
+			process.env.OPENAI_API_KEY ||
+			'not-needed';
+
+		// Create and return a configured axios instance
+		return axios.create({
+			baseURL,
+			headers: {
+				'Content-Type': 'application/json',
+				...(apiKey && apiKey !== 'not-needed'
+					? { Authorization: `Bearer ${apiKey}` }
+					: {})
+			}
+		});
+	} catch (error) {
+		log.error(
+			`Failed to initialize OpenAI compatible client: ${error.message}`
+		);
 		throw error;
 	}
 }
@@ -113,6 +157,32 @@ export async function getBestAvailableAIModel(
 ) {
 	const { requiresResearch = false, claudeOverloaded = false } = options;
 
+	// Check if OpenAI compatible API is configured and preferred
+	if (session?.env?.OPENAI_API_BASE_URL || process.env.OPENAI_API_BASE_URL) {
+		try {
+			// If this is a research operation and Perplexity is available, still use that
+			if (
+				requiresResearch &&
+				(session?.env?.PERPLEXITY_API_KEY || process.env.PERPLEXITY_API_KEY)
+			) {
+				try {
+					const client = await getPerplexityClientForMCP(session, log);
+					return { type: 'perplexity', client };
+				} catch (error) {
+					log.warn(`Perplexity not available: ${error.message}`);
+					// Fall through to OpenAI compatible
+				}
+			}
+
+			log.info(`Using OpenAI compatible API`);
+			const client = getOpenAICompatibleClientForMCP(session, log);
+			return { type: 'openai_compatible', client };
+		} catch (error) {
+			log.warn(`OpenAI compatible API not available: ${error.message}`);
+			// Fall through to Anthropic or Perplexity
+		}
+	}
+
 	// Test case: When research is needed but no Perplexity, use Claude
 	if (
 		requiresResearch &&
@@ -177,7 +247,9 @@ export async function getBestAvailableAIModel(
 	}
 
 	// If we got here, no models were successfully initialized
-	throw new Error('No AI models available. Please check your API keys.');
+	throw new Error(
+		'No AI models available. Please check your API keys and configurations.'
+	);
 }
 
 /**
@@ -210,4 +282,49 @@ export function handleClaudeError(error) {
 
 	// Default error message
 	return `Error communicating with Claude: ${error.message}`;
+}
+
+/**
+ * Handle OpenAI compatible API errors with user-friendly messages
+ * @param {Error} error - The error from OpenAI compatible API
+ * @returns {string} User-friendly error message
+ */
+export function handleOpenAICompatibleError(error) {
+	// Check for response errors
+	if (error.response) {
+		const status = error.response.status;
+		const data = error.response.data;
+
+		// Handle common HTTP status codes
+		switch (status) {
+			case 401:
+				return 'Authentication error: The API key provided is invalid or missing.';
+			case 403:
+				return 'Authorization error: You do not have permission to access this resource.';
+			case 404:
+				return 'Not found: The requested model or endpoint does not exist.';
+			case 429:
+				return 'Rate limit exceeded: You have sent too many requests. Please wait and try again later.';
+			case 500:
+			case 502:
+			case 503:
+			case 504:
+				return `Server error (${status}): The AI service is experiencing issues. Please try again later.`;
+			default:
+				return `API error (${status}): ${JSON.stringify(data)}`;
+		}
+	}
+
+	// Check for network/connection errors
+	if (error.request) {
+		return `Network error: No response received. Check your OPENAI_API_BASE_URL.`;
+	}
+
+	// Check for model errors
+	if (error.message?.includes('model')) {
+		return `Model error: The requested model may not be available. Please check that you have the correct model name.`;
+	}
+
+	// Default error message
+	return `Error communicating with AI service: ${error.message}`;
 }

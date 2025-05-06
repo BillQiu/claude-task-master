@@ -22,10 +22,21 @@ import { displayBanner } from './ui.js';
 
 import { generateTaskFiles } from './task-manager.js';
 
-// Initialize Anthropic client
-const anthropic = new Anthropic({
-	apiKey: process.env.ANTHROPIC_API_KEY
-});
+import {
+	createAIClient,
+	invokeAIModel,
+	determineAIProvider,
+	AI_PROVIDER
+} from './ai-unified-client.js';
+
+// Initialize AI client (Anthropic or OpenAI compatible)
+let aiClient;
+try {
+	aiClient = createAIClient();
+} catch (error) {
+	log('warn', `AI client initialization warning: ${error.message}`);
+	log('warn', 'Will attempt to create a client when needed');
+}
 
 /**
  * Add a dependency to a task

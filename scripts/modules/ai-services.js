@@ -11,18 +11,25 @@ import dotenv from 'dotenv';
 import { CONFIG, log, sanitizePrompt, isSilentMode } from './utils.js';
 import { startLoadingIndicator, stopLoadingIndicator } from './ui.js';
 import chalk from 'chalk';
+import {
+	createAIClient,
+	invokeAIModel,
+	determineAIProvider,
+	AI_PROVIDER
+} from './ai-unified-client.js';
 
 // Load environment variables
 dotenv.config();
 
-// Configure Anthropic client
-const anthropic = new Anthropic({
-	apiKey: process.env.ANTHROPIC_API_KEY,
-	// Add beta header for 128k token output
-	defaultHeaders: {
-		'anthropic-beta': 'output-128k-2025-02-19'
-	}
-});
+// Configure AI client based on environment variables
+let anthropic;
+try {
+	// Attempt to create a client using our unified approach
+	anthropic = createAIClient();
+} catch (error) {
+	log('warn', `AI client initialization warning: ${error.message}`);
+	log('warn', 'Will attempt to create a client when needed');
+}
 
 // Lazy-loaded Perplexity client
 let perplexity = null;
@@ -63,42 +70,66 @@ function getAvailableAIModel(options = {}) {
 			return { type: 'perplexity', client };
 		} catch (error) {
 			log('warn', `Perplexity not available: ${error.message}`);
-			// Fall through to Claude
+			// Fall through to main AI provider
 		}
 	}
 
-	// Second choice: Claude if not overloaded
-	if (!claudeOverloaded && process.env.ANTHROPIC_API_KEY) {
-		return { type: 'claude', client: anthropic };
-	}
-
-	// Third choice: Perplexity as Claude fallback (even if research not required)
-	if (process.env.PERPLEXITY_API_KEY) {
-		try {
-			const client = getPerplexityClient();
-			log('info', 'Claude is overloaded, falling back to Perplexity');
-			return { type: 'perplexity', client };
-		} catch (error) {
-			log('warn', `Perplexity fallback not available: ${error.message}`);
-			// Fall through to Claude anyway with warning
+	// Second choice: Main AI provider (OpenAI compatible or Anthropic)
+	try {
+		// If anthropic is null, try to create it now
+		if (!anthropic) {
+			anthropic = createAIClient();
 		}
-	}
 
-	// Last resort: Use Claude even if overloaded (might fail)
-	if (process.env.ANTHROPIC_API_KEY) {
-		if (claudeOverloaded) {
+		// Get the current provider type
+		const providerType = determineAIProvider();
+		if (providerType === AI_PROVIDER.OPENAI_COMPATIBLE) {
+			return { type: 'openai_compatible', client: anthropic };
+		} else {
+			// For Anthropic, check if it's overloaded
+			if (!claudeOverloaded) {
+				return { type: 'claude', client: anthropic };
+			}
+
+			// If Claude is overloaded, see if we can fall back to Perplexity
+			if (process.env.PERPLEXITY_API_KEY) {
+				try {
+					const client = getPerplexityClient();
+					log('info', 'Claude is overloaded, falling back to Perplexity');
+					return { type: 'perplexity', client };
+				} catch (error) {
+					log('warn', `Perplexity fallback not available: ${error.message}`);
+					// Fall through to Claude anyway with warning
+				}
+			}
+
+			// Last resort: Use Claude even if overloaded
 			log(
 				'warn',
 				'Claude is overloaded but no alternatives are available. Proceeding with Claude anyway.'
 			);
+			return { type: 'claude', client: anthropic };
 		}
-		return { type: 'claude', client: anthropic };
-	}
+	} catch (error) {
+		// If the main AI provider fails, try Perplexity as a last resort for non-research tasks
+		if (!requiresResearch && process.env.PERPLEXITY_API_KEY) {
+			try {
+				const client = getPerplexityClient();
+				log('info', 'Main AI provider unavailable, falling back to Perplexity');
+				return { type: 'perplexity', client };
+			} catch (perplexityError) {
+				// Both providers failed
+				throw new Error(
+					`No AI models available. Main AI error: ${error.message}. Perplexity error: ${perplexityError.message}`
+				);
+			}
+		}
 
-	// No models available
-	throw new Error(
-		'No AI models available. Please set ANTHROPIC_API_KEY and/or PERPLEXITY_API_KEY.'
-	);
+		// No fallback options available
+		throw new Error(
+			`No AI models available. Please set ANTHROPIC_API_KEY, OPENAI_API_BASE_URL, and/or PERPLEXITY_API_KEY.`
+		);
+	}
 }
 
 /**
@@ -161,7 +192,7 @@ async function callClaude(
 	modelConfig = null
 ) {
 	try {
-		log('info', 'Calling Claude...');
+		log('info', 'Calling AI service...');
 
 		// Build the system prompt
 		const systemPrompt = `You are an AI assistant tasked with breaking down a Product Requirements Document (PRD) into a set of sequential development tasks. Your goal is to create exactly <num_tasks>${numTasks}</num_tasks> well-structured, actionable development tasks based on the PRD provided.
@@ -197,86 +228,186 @@ Guidelines for creating tasks:
 4. Start with setup and core functionality, then move to advanced features.
 5. Provide a clear validation/testing approach for each task.
 6. Set appropriate dependency IDs (tasks can only depend on lower-numbered tasks).
-7. Assign priority based on criticality and dependency order.
-8. Include detailed implementation guidance in the "details" field.
-9. Strictly adhere to any specific requirements for libraries, database schemas, frameworks, tech stacks, or other implementation details mentioned in the PRD.
-10. Fill in gaps left by the PRD while preserving all explicit requirements.
-11. Provide the most direct path to implementation, avoiding over-engineering.
+7. Assign priority based on criticality and dependency order.`;
 
-The final output should be valid JSON with this structure:
+		// If metadata exists, include it in the system prompt
+		const metadataPrompt = `
 
-{
-  "tasks": [
-    {
-      "id": 1,
-      "title": "Example Task Title",
-      "description": "Brief description of the task",
-      "status": "pending",
-      "dependencies": [0],
-      "priority": "high",
-      "details": "Detailed implementation guidance",
-      "testStrategy": "Approach for validating this task"
-    },
-    // ... more tasks ...
-  ],
-  "metadata": {
-    "projectName": "PRD Implementation",
-    "totalTasks": <num_tasks>${numTasks}</num_tasks>,
-    "sourceFile": "<prd_path>${prdPath}</prd_path>",
-    "generatedAt": "YYYY-MM-DD"
-  }
-}
+Project Metadata:
+- Project Name: ${process.env.PROJECT_NAME || 'Your Project'}
+- Extracted from: ${prdPath}
+- Tasks to generate: ${numTasks}`;
 
-Remember to provide comprehensive task details that are LLM-friendly, consider dependencies and maintainability carefully, and keep in mind that you don't have the existing codebase as context. Aim for a balance between detailed guidance and high-level planning.
+		const fullSystemPrompt = systemPrompt + metadataPrompt;
 
-Your response should be valid JSON only, with no additional explanation or comments. Do not duplicate or rehash any of the work you did in the prd_breakdown section in your final output.`;
+		// Set up the user message with PRD content
+		const userMessage = `Here is the PRD to analyze and convert into ${numTasks} tasks:
 
-		// Use streaming request to handle large responses and show progress
-		return await handleStreamingRequest(
-			prdContent,
-			prdPath,
-			numTasks,
-			modelConfig?.maxTokens || CONFIG.maxTokens,
-			systemPrompt,
-			{ reportProgress, mcpLog, session },
-			aiClient || anthropic,
-			modelConfig
-		);
-	} catch (error) {
-		// Get user-friendly error message
-		const userMessage = handleClaudeError(error);
-		log('error', userMessage);
+${prdContent}
 
-		// Retry logic for certain errors
-		if (
-			retryCount < 2 &&
-			(error.error?.type === 'overloaded_error' ||
-				error.error?.type === 'rate_limit_error' ||
-				error.message?.toLowerCase().includes('timeout') ||
-				error.message?.toLowerCase().includes('network'))
-		) {
-			const waitTime = (retryCount + 1) * 5000; // 5s, then 10s
-			log(
-				'info',
-				`Waiting ${waitTime / 1000} seconds before retry ${retryCount + 1}/2...`
-			);
-			await new Promise((resolve) => setTimeout(resolve, waitTime));
-			return await callClaude(
+Remember to follow the guidelines and create exactly ${numTasks} well-structured tasks in the JSON format specified.`;
+
+		// Set default modelConfig if not provided
+		if (!modelConfig) {
+			modelConfig = {
+				maxTokens: parseInt(process.env.MAX_TOKENS || '64000'),
+				temperature: parseFloat(process.env.TEMPERATURE || '0.2')
+			};
+		}
+
+		// Determine whether to use streaming based on reportProgress
+		const useStreaming = !!reportProgress;
+
+		if (useStreaming) {
+			return await handleStreamingRequest(
 				prdContent,
 				prdPath,
 				numTasks,
-				retryCount + 1,
+				modelConfig.maxTokens,
+				fullSystemPrompt,
 				{ reportProgress, mcpLog, session },
-				aiClient,
-				modelConfig
+				aiClient
 			);
-		} else {
-			console.error(chalk.red(userMessage));
-			if (CONFIG.debug) {
-				log('debug', 'Full error:', error);
-			}
-			throw new Error(userMessage);
 		}
+
+		// If not streaming, call the client directly
+		let modelResponse;
+		// If an aiClient was provided, use it (from direct test or from fallback mechanism)
+		if (aiClient) {
+			log('debug', 'Using provided AI client');
+
+			// Determine whether this is an Anthropic, OpenAI compatible or Perplexity client
+			const clientType =
+				aiClient.provider === AI_PROVIDER.OPENAI_COMPATIBLE
+					? 'openai_compatible'
+					: aiClient.baseURL === 'https://api.perplexity.ai'
+						? 'perplexity'
+						: 'claude';
+
+			if (clientType === 'openai_compatible' || clientType === 'claude') {
+				// Use the messages.create method for both Anthropic and OpenAI compatible
+				const response = await aiClient.messages.create({
+					model: process.env.MODEL || 'claude-3-7-sonnet-20250219',
+					max_tokens: modelConfig.maxTokens,
+					temperature: modelConfig.temperature,
+					system: fullSystemPrompt,
+					messages: [
+						{
+							role: clientType === 'claude' ? 'human' : 'user',
+							content: userMessage
+						}
+					]
+				});
+
+				// Extract the response text based on the client type
+				if (clientType === 'claude') {
+					modelResponse = response.content[0].text;
+				} else {
+					modelResponse = response.content[0].text;
+				}
+			} else if (clientType === 'perplexity') {
+				// For Perplexity, use the OpenAI-compatible interface
+				const response = await aiClient.chat.completions.create({
+					model: process.env.PERPLEXITY_MODEL || 'sonar-medium-online',
+					temperature: modelConfig.temperature,
+					max_tokens: modelConfig.maxTokens,
+					messages: [
+						{ role: 'system', content: fullSystemPrompt },
+						{ role: 'user', content: userMessage }
+					]
+				});
+				modelResponse = response.choices[0].message.content;
+			}
+		} else {
+			// No client provided, use our unified invokeAIModel
+			log('debug', 'Using unified AI model interface');
+
+			// Create messages in format expected by invokeAIModel
+			const messages = [
+				{ role: 'system', content: fullSystemPrompt },
+				{ role: 'user', content: userMessage }
+			];
+
+			// Call the unified API
+			modelResponse = await invokeAIModel(messages, modelConfig);
+		}
+
+		// Process the response to extract JSON
+		return processClaudeResponse(
+			modelResponse,
+			numTasks,
+			retryCount,
+			prdContent,
+			prdPath,
+			{ reportProgress, mcpLog, session }
+		);
+	} catch (error) {
+		// Handle overloaded errors by retrying with a different model if possible
+		const errorMessage = error.message?.toLowerCase() || '';
+		if (
+			errorMessage.includes('overloaded') &&
+			errorMessage.includes('claude') &&
+			retryCount < 2
+		) {
+			log(
+				'warn',
+				'Claude is overloaded. Attempting to use an alternative AI model...'
+			);
+
+			if (reportProgress) {
+				reportProgress({
+					progress: 0,
+					status:
+						'Claude is overloaded. Attempting to use an alternative AI model...'
+				});
+			}
+
+			// On overload error, try to get a different AI model and retry
+			try {
+				const alternativeModel = await getAvailableAIModel({
+					claudeOverloaded: true,
+					requiresResearch: false
+				});
+
+				// If we can get an alternative, try again with that
+				return await callClaude(
+					prdContent,
+					prdPath,
+					numTasks,
+					retryCount + 1,
+					{ reportProgress, mcpLog },
+					alternativeModel.client,
+					modelConfig
+				);
+			} catch (fallbackError) {
+				// If we can't get an alternative, throw the original error
+				throw error;
+			}
+		}
+
+		// Handle other errors
+		if (retryCount < 2) {
+			log(
+				'warn',
+				`Error calling AI service: ${error.message}. Retrying (${retryCount + 1}/2)...`
+			);
+
+			if (reportProgress) {
+				reportProgress({
+					progress: 0,
+					status: `Error: ${error.message}. Retrying (${retryCount + 1}/2)...`
+				});
+			}
+
+			// General retry without changing models
+			return await callClaude(prdContent, prdPath, numTasks, retryCount + 1, {
+				reportProgress,
+				mcpLog
+			});
+		}
+
+		// If we've exhausted retries, throw the error
+		throw error;
 	}
 }
 
@@ -1277,33 +1408,35 @@ function _buildAddTaskPrompt(prompt, contextTasks, { newTaskId } = {}) {
 }
 
 /**
- * Get an Anthropic client instance
- * @param {Object} [session] - Optional session object from MCP
- * @returns {Anthropic} Anthropic client instance
+ * Get a properly configured AI client (Anthropic or OpenAI compatible)
+ * @param {Object} session - Session object from MCP server (optional)
+ * @param {Object} customEnv - Custom environment variables (optional)
+ * @returns {Object} Configured AI client
  */
-function getAnthropicClient(session) {
-	// If we already have a global client and no session, use the global
-	if (!session && anthropic) {
-		return anthropic;
-	}
+function getConfiguredAnthropicClient(session = null, customEnv = null) {
+	// For backward compatibility, we keep the function name as getConfiguredAnthropicClient
+	// but it now returns either an Anthropic client or an OpenAI compatible client
 
-	// Initialize a new client with API key from session or environment
-	const apiKey =
-		session?.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+	// Use custom environment variables if provided (useful for testing)
+	if (customEnv) {
+		// If custom environment is provided, use it for this call
+		const originalEnv = process.env;
+		try {
+			// Temporarily set environment variables
+			Object.keys(customEnv).forEach((key) => {
+				process.env[key] = customEnv[key];
+			});
 
-	if (!apiKey) {
-		throw new Error(
-			'ANTHROPIC_API_KEY environment variable is missing. Set it to use AI features.'
-		);
-	}
-
-	return new Anthropic({
-		apiKey: apiKey,
-		// Add beta header for 128k token output
-		defaultHeaders: {
-			'anthropic-beta': 'output-128k-2025-02-19'
+			// Create client with the custom environment
+			return createAIClient({ session });
+		} finally {
+			// Restore original environment variables
+			process.env = originalEnv;
 		}
-	});
+	}
+
+	// For session-based client creation
+	return createAIClient({ session });
 }
 
 /**
@@ -1453,52 +1586,91 @@ Return a JSON object with the following structure:
 }
 
 /**
- * Get a configured Anthropic client for MCP
- * @param {Object} session - Session object from MCP
- * @param {Object} log - Logger object
- * @returns {Anthropic} - Configured Anthropic client
- */
-function getConfiguredAnthropicClient(session = null, customEnv = null) {
-	// If we have a session with ANTHROPIC_API_KEY in env, use that
-	const apiKey =
-		session?.env?.ANTHROPIC_API_KEY ||
-		process.env.ANTHROPIC_API_KEY ||
-		customEnv?.ANTHROPIC_API_KEY;
-
-	if (!apiKey) {
-		throw new Error(
-			'ANTHROPIC_API_KEY environment variable is missing. Set it to use AI features.'
-		);
-	}
-
-	return new Anthropic({
-		apiKey: apiKey,
-		// Add beta header for 128k token output
-		defaultHeaders: {
-			'anthropic-beta': 'output-128k-2025-02-19'
-		}
-	});
-}
-
-/**
- * Send a chat request to Claude with context management
- * @param {Object} client - Anthropic client
- * @param {Object} params - Chat parameters
- * @param {Object} options - Options containing reportProgress, mcpLog, silentMode, and session
- * @returns {string} - Response text
+ * Send a chat message with context handling
+ * @param {Object} client - AI client (Anthropic or OpenAI compatible)
+ * @param {Object} params - Parameters for the chat request
+ * @param {Object} options - Optional parameters
+ * @returns {Object} - Response from the AI model
  */
 async function sendChatWithContext(
 	client,
 	params,
 	{ reportProgress, mcpLog, silentMode, session } = {}
 ) {
-	// Use the streaming helper to get the response
-	return await _handleAnthropicStream(
-		client,
-		params,
-		{ reportProgress, mcpLog, silentMode },
-		false
-	);
+	try {
+		// Determine client type if needed
+		const clientType =
+			client.provider === AI_PROVIDER.OPENAI_COMPATIBLE
+				? 'openai_compatible'
+				: client.baseURL === 'https://api.perplexity.ai'
+					? 'perplexity'
+					: 'claude';
+
+		// Handle different client types
+		if (clientType === 'openai_compatible') {
+			// For OpenAI compatible clients, we need to convert the messages format
+			if (params.messages) {
+				const openaiMessages = convertToOpenAIMessages({
+					system: params.system,
+					messages: params.messages
+				});
+
+				// Use invokeAIModel for unified calling
+				const response = await invokeAIModel(openaiMessages, {
+					model: params.model,
+					maxTokens: params.max_tokens,
+					temperature: params.temperature
+				});
+
+				// Return in a format similar to Anthropic's response
+				return {
+					id: 'openai-compatible-message',
+					content: [{ text: response, type: 'text' }],
+					model: params.model,
+					role: 'assistant'
+				};
+			}
+		} else if (clientType === 'perplexity') {
+			// For Perplexity, use the OpenAI-compatible interface
+			const messages = [];
+
+			// Add system message if present
+			if (params.system) {
+				messages.push({ role: 'system', content: params.system });
+			}
+
+			// Add other messages
+			if (Array.isArray(params.messages)) {
+				params.messages.forEach((msg) => {
+					const role = msg.role === 'human' ? 'user' : 'assistant';
+					messages.push({ role, content: msg.content });
+				});
+			}
+
+			// Call Perplexity API
+			const response = await client.chat.completions.create({
+				model:
+					params.model || process.env.PERPLEXITY_MODEL || 'sonar-medium-online',
+				temperature: params.temperature,
+				max_tokens: params.max_tokens,
+				messages
+			});
+
+			// Return in a format similar to Anthropic's response
+			return {
+				id: 'perplexity-message',
+				content: [{ text: response.choices[0].message.content, type: 'text' }],
+				model: params.model,
+				role: 'assistant'
+			};
+		}
+
+		// For Anthropic client, use the client.messages.create method directly
+		return await client.messages.create(params);
+	} catch (error) {
+		log('error', `Error in sendChatWithContext: ${error.message}`);
+		throw error;
+	}
 }
 
 /**
@@ -1537,7 +1709,7 @@ function parseTasksFromCompletion(completionText) {
 
 // Export AI service functions
 export {
-	getAnthropicClient,
+	// getAnthropicClient,
 	getPerplexityClient,
 	callClaude,
 	handleStreamingRequest,
